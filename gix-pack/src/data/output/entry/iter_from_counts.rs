@@ -54,7 +54,6 @@ pub(crate) mod function {
             chunk_size,
         }: Options,
     ) -> impl Iterator<Item = Result<(SequenceId, Vec<output::Entry>), Error>>
-           + parallel::reduce::Finalize<Reduce = reduce::Statistics<Error>>
     where
         Find: crate::Find + Send + Clone + 'static,
     {
@@ -62,39 +61,30 @@ pub(crate) mod function {
             matches!(version, crate::data::Version::V2),
             "currently we can only write version 2"
         );
+        // Figures out how to parallelize the work
         let (chunk_size, thread_limit, _) =
             parallel::optimize_chunk_size_and_thread_limit(chunk_size, Some(counts.len()), thread_limit, None);
         {
+            // Progress stuff, ignore
             let progress = Arc::new(parking_lot::Mutex::new(
                 progress.add_child_with_id("resolving".into(), ProgressId::ResolveCounts.into()),
             ));
             progress.lock().init(None, gix_features::progress::count("counts"));
             let enough_counts_present = counts.len() > 4_000;
             let start = std::time::Instant::now();
-            parallel::in_parallel_if(
-                || enough_counts_present,
-                counts.chunks_mut(chunk_size),
-                thread_limit,
-                |_n| Vec::<u8>::new(),
-                {
-                    let progress = Arc::clone(&progress);
-                    let db = db.clone();
-                    move |chunk, buf| {
-                        let chunk_size = chunk.len();
-                        for count in chunk {
-                            use crate::data::output::count::PackLocation::*;
-                            match count.entry_pack_location {
-                                LookedUp(_) => continue,
-                                NotLookedUp => count.entry_pack_location = LookedUp(db.location_by_oid(&count.id, buf)),
-                            }
-                        }
-                        progress.lock().inc_by(chunk_size);
-                        Ok::<_, ()>(())
+            for chunk in counts.chunks_mut(chunk_size) {
+                let mut buf = Vec::new();
+                let chunk_size = chunk.len();
+                for count in chunk {
+                    use crate::data::output::count::PackLocation::*;
+                    // If the entry is looked up, we continue, otherwise we look it up here
+                    match count.entry_pack_location {
+                        LookedUp(_) => continue,
+                        NotLookedUp => count.entry_pack_location = LookedUp(db.location_by_oid(&count.id, &mut buf)),
                     }
-                },
-                parallel::reduce::IdentityWithResult::<(), ()>::default(),
-            )
-            .expect("infallible - we ignore none-existing objects");
+                }
+                progress.lock().inc_by(chunk_size);
+            }
             progress.lock().show_throughput(start);
         }
         let counts_range_by_pack_id = match mode {
@@ -104,6 +94,7 @@ pub(crate) mod function {
                 let start = std::time::Instant::now();
 
                 use crate::data::output::count::PackLocation::*;
+                // Sort by pack_id if exists
                 counts.sort_by(|lhs, rhs| match (&lhs.entry_pack_location, &rhs.entry_pack_location) {
                     (LookedUp(None), LookedUp(None)) => Ordering::Equal,
                     (LookedUp(Some(_)), LookedUp(None)) => Ordering::Greater,
@@ -116,13 +107,18 @@ pub(crate) mod function {
                 });
 
                 let mut index: Vec<(u32, std::ops::Range<usize>)> = Vec::new();
+
+                // Get just the entries with pack ids
                 let mut chunks_pack_start = counts.partition_point(|e| e.entry_pack_location.is_none());
                 let mut slice = &counts[chunks_pack_start..];
                 while !slice.is_empty() {
+                    // get pack id
                     let current_pack_id = slice[0].entry_pack_location.as_ref().expect("packed object").pack_id;
+                    // get all the entries with that pack
                     let pack_end = slice.partition_point(|e| {
                         e.entry_pack_location.as_ref().expect("packed object").pack_id == current_pack_id
                     });
+                    // push that pack id and the range onto the vector
                     index.push((current_pack_id, chunks_pack_start..chunks_pack_start + pack_end));
                     slice = &slice[pack_end..];
                     chunks_pack_start += pack_end;
@@ -137,93 +133,74 @@ pub(crate) mod function {
 
         let counts = Arc::new(counts);
         let progress = Arc::new(parking_lot::Mutex::new(progress));
+        // Process counts in chunks
         let chunks = util::ChunkRanges::new(chunk_size, counts.len());
 
-        parallel::reduce::Stepwise::new(
-            chunks.enumerate(),
-            thread_limit,
-            {
-                let progress = Arc::clone(&progress);
-                move |n| {
-                    (
-                        Vec::new(), // object data buffer
-                        progress
-                            .lock()
-                            .add_child_with_id(format!("thread {n}"), gix_features::progress::UNKNOWN),
-                    )
-                }
-            },
-            {
-                let counts = Arc::clone(&counts);
-                move |(chunk_id, chunk_range): (SequenceId, std::ops::Range<usize>), (buf, progress)| {
-                    let mut out = Vec::new();
-                    let chunk = &counts[chunk_range];
-                    let mut stats = Outcome::default();
-                    let mut pack_offsets_to_id = None;
-                    progress.init(Some(chunk.len()), gix_features::progress::count("objects"));
+        for chunk_range in chunks {
+            let mut buf = Vec::new();
+            let mut out = Vec::new();
+            // Get the counts as a slice
+            let chunk = &counts[chunk_range];
+            let mut stats = Outcome::default();
+            let mut pack_offsets_to_id = None;
 
-                    for count in chunk.iter() {
-                        out.push(match count
-                            .entry_pack_location
-                            .as_ref()
-                            .and_then(|l| db.entry_by_location(l).map(|pe| (l, pe)))
-                        {
-                            Some((location, pack_entry)) => {
-                                if let Some((cached_pack_id, _)) = &pack_offsets_to_id {
-                                    if *cached_pack_id != location.pack_id {
-                                        pack_offsets_to_id = None;
-                                    }
-                                }
-                                let pack_range = counts_range_by_pack_id[counts_range_by_pack_id
-                                    .binary_search_by_key(&location.pack_id, |e| e.0)
-                                    .expect("pack-id always present")]
-                                .1
-                                .clone();
-                                let base_index_offset = pack_range.start;
-                                let counts_in_pack = &counts[pack_range];
-                                let entry = output::Entry::from_pack_entry(
-                                    pack_entry,
-                                    count,
-                                    counts_in_pack,
-                                    base_index_offset,
-                                    allow_thin_pack.then_some({
-                                        |pack_id, base_offset| {
-                                            let (cached_pack_id, cache) = pack_offsets_to_id.get_or_insert_with(|| {
-                                                db.pack_offsets_and_oid(pack_id)
-                                                    .map(|mut v| {
-                                                        v.sort_by_key(|e| e.0);
-                                                        (pack_id, v)
-                                                    })
-                                                    .expect("pack used for counts is still available")
-                                            });
-                                            debug_assert_eq!(*cached_pack_id, pack_id);
-                                            stats.ref_delta_objects += 1;
-                                            cache
-                                                .binary_search_by_key(&base_offset, |e| e.0)
-                                                .ok()
-                                                .map(|idx| cache[idx].1)
-                                        }
-                                    }),
-                                    version,
-                                );
-                                match entry {
-                                    Some(entry) => {
-                                        stats.objects_copied_from_pack += 1;
-                                        entry
-                                    }
-                                    None => match db.try_find(&count.id, buf).map_err(Error::Find)? {
-                                        Some((obj, _location)) => {
-                                            stats.decoded_and_recompressed_objects += 1;
-                                            output::Entry::from_data(count, &obj)
-                                        }
-                                        None => {
-                                            stats.missing_objects += 1;
-                                            Ok(output::Entry::invalid())
-                                        }
-                                    },
-                                }
+            // Iterate through counts
+            for count in chunk.iter() {
+                // Get the pack location and if it exists, get the entry by the location
+                out.push(match count
+                    .entry_pack_location
+                    .as_ref()
+                    .and_then(|l| db.entry_by_location(l).map(|pe| (l, pe)))
+                {
+                    Some((location, pack_entry)) => {
+                        // If we have a pack_offsets_to_id, if the pack id has changed, we reset it
+                        if let Some((cached_pack_id, _)) = &pack_offsets_to_id {
+                            if *cached_pack_id != location.pack_id {
+                                pack_offsets_to_id = None;
                             }
-                            None => match db.try_find(&count.id, buf).map_err(Error::Find)? {
+                        }
+
+                        // Get the pack range
+                        let pack_range = counts_range_by_pack_id[counts_range_by_pack_id
+                            .binary_search_by_key(&location.pack_id, |e| e.0)
+                            .expect("pack-id always present")]
+                        .1
+                        .clone();
+                        let base_index_offset = pack_range.start;
+                        // Get the counts slice
+                        let counts_in_pack = &counts[pack_range];
+                        let entry = output::Entry::from_pack_entry(
+                            pack_entry,
+                            count,
+                            counts_in_pack,
+                            base_index_offset,
+                            // Resolves thin packs
+                            allow_thin_pack.then_some({
+                                |pack_id, base_offset| {
+                                    let (cached_pack_id, cache) = pack_offsets_to_id.get_or_insert_with(|| {
+                                        db.pack_offsets_and_oid(pack_id)
+                                            .map(|mut v| {
+                                                v.sort_by_key(|e| e.0);
+                                                (pack_id, v)
+                                            })
+                                            .expect("pack used for counts is still available")
+                                    });
+                                    debug_assert_eq!(*cached_pack_id, pack_id);
+                                    stats.ref_delta_objects += 1;
+                                    cache
+                                        .binary_search_by_key(&base_offset, |e| e.0)
+                                        .ok()
+                                        .map(|idx| cache[idx].1)
+                                }
+                            }),
+                            version,
+                        );
+                        match entry {
+                            Some(entry) => {
+                                stats.objects_copied_from_pack += 1;
+                                entry
+                            }
+                            None => match db.try_find(&count.id, &mut buf).map_err(Error::Find)? {
                                 Some((obj, _location)) => {
                                     stats.decoded_and_recompressed_objects += 1;
                                     output::Entry::from_data(count, &obj)
@@ -233,14 +210,21 @@ pub(crate) mod function {
                                     Ok(output::Entry::invalid())
                                 }
                             },
-                        }?);
-                        progress.inc();
+                        }
                     }
-                    Ok((chunk_id, out, stats))
-                }
-            },
-            reduce::Statistics::default(),
-        )
+                    None => match db.try_find(&count.id, &mut buf).map_err(Error::Find)? {
+                        Some((obj, _location)) => {
+                            stats.decoded_and_recompressed_objects += 1;
+                            output::Entry::from_data(count, &obj)
+                        }
+                        None => {
+                            stats.missing_objects += 1;
+                            Ok(output::Entry::invalid())
+                        }
+                    },
+                }?);
+            }
+        }
     }
 }
 
