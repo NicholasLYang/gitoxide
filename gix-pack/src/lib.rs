@@ -1,3 +1,4 @@
+#![feature(async_iterator)]
 //! Git stores all of its data as _Objects_, which are data along with a hash over all data. Storing objects efficiently
 //! is what git packs are concerned about.
 //!

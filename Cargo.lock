@@ -189,6 +189,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-gen"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f872d9d498f6cc7a18aff10f2658f17fc5d729928625d68169aaa29febdf813"
+dependencies = [
+ "async-gen-macros",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-gen-macros"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "017a711dbce72e9467fea4f6e55afc8cf8e4306a53c80593bad684e8eccef122"
+
+[[package]]
 name = "async-global-executor"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2262,6 +2279,7 @@ dependencies = [
 name = "gix-pack"
 version = "0.57.0"
 dependencies = [
+ "async-gen",
  "clru",
  "document-features",
  "gix-chunk 0.4.11",
