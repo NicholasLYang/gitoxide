@@ -3,6 +3,7 @@ pub(crate) mod function {
     use async_gen::AsyncIter;
     use std::{cmp::Ordering, sync::Arc};
 
+    use crate::{data, find};
     use gix_features::{
         parallel,
         parallel::SequenceId,
@@ -245,6 +246,69 @@ pub(crate) mod function {
         )
     }
 
+    /// Describe how object can be located in an object store with built-in facilities to supports packs specifically.
+    ///
+    /// ## Notes
+    ///
+    /// Find effectively needs [generic associated types][issue] to allow a trait for the returned object type.
+    /// Until then, we will have to make due with explicit types and give them the potentially added features we want.
+    ///
+    /// Furthermore, despite this trait being in `gix-pack`, it leaks knowledge about objects potentially not being packed.
+    /// This is a necessary trade-off to allow this trait to live in `gix-pack` where it is used in functions to create a pack.
+    ///
+    /// [issue]: https://github.com/rust-lang/rust/issues/44265
+    pub trait AsyncFind {
+        /// Returns true if the object exists in the database.
+        async fn contains(&self, id: &gix_hash::oid) -> bool;
+
+        /// Find an object matching `id` in the database while placing its raw, decoded data into `buffer`.
+        /// A `pack_cache` can be used to speed up subsequent lookups, set it to [`crate::cache::Never`] if the
+        /// workload isn't suitable for caching.
+        ///
+        /// Returns `Some((<object data>, <pack location if packed>))` if it was present in the database,
+        /// or the error that occurred during lookup or object retrieval.
+        async fn try_find<'a>(
+            &self,
+            id: &gix_hash::oid,
+            buffer: &'a mut Vec<u8>,
+        ) -> Result<Option<(gix_object::Data<'a>, Option<data::entry::Location>)>, gix_object::find::Error> {
+            self.try_find_cached(id, buffer, &mut crate::cache::Never).await
+        }
+
+        /// Like [`Find::try_find()`], but with support for controlling the pack cache.
+        /// A `pack_cache` can be used to speed up subsequent lookups, set it to [`crate::cache::Never`] if the
+        /// workload isn't suitable for caching.
+        ///
+        /// Returns `Some((<object data>, <pack location if packed>))` if it was present in the database,
+        /// or the error that occurred during lookup or object retrieval.
+        async fn try_find_cached<'a>(
+            &self,
+            id: &gix_hash::oid,
+            buffer: &'a mut Vec<u8>,
+            pack_cache: &mut dyn crate::cache::DecodeEntry,
+        ) -> Result<Option<(gix_object::Data<'a>, Option<data::entry::Location>)>, gix_object::find::Error>;
+
+        /// Find the packs location where an object with `id` can be found in the database, or `None` if there is no pack
+        /// holding the object.
+        ///
+        /// _Note_ that this is always None if the object isn't packed even though it exists as loose object.
+        async fn location_by_oid(&self, id: &gix_hash::oid, buf: &mut Vec<u8>) -> Option<data::entry::Location>;
+
+        /// Obtain a vector of all offsets, in index order, along with their object id.
+        async fn pack_offsets_and_oid(&self, pack_id: u32) -> Option<Vec<(data::Offset, gix_hash::ObjectId)>>;
+
+        /// Return the [`find::Entry`] for `location` if it is backed by a pack.
+        ///
+        /// Note that this is only in the interest of avoiding duplicate work during pack generation.
+        /// Pack locations can be obtained from [`Find::try_find()`].
+        ///
+        /// # Notes
+        ///
+        /// Custom implementations might be interested in providing their own meta-data with `object`,
+        /// which currently isn't possible as the `Locate` trait requires GATs to work like that.
+        async fn entry_by_location(&self, location: &data::entry::Location) -> Option<find::Entry>;
+    }
+
     /// Given a known list of object `counts`, calculate entries ready to be put into a data pack.
     ///
     /// This allows objects to be written quite soon without having to wait for the entire pack to be built in memory.
@@ -274,7 +338,7 @@ pub(crate) mod function {
     ///   so with minimal overhead (especially compared to `gix index-from-pack`)~~ Probably works now by chaining Iterators
     ///   or keeping enough state to write a pack and then generate an index with recorded data.
     ///
-    pub fn async_iter_from_counts<Find>(
+    pub async fn async_iter_from_counts<Find>(
         mut counts: Vec<output::Count>,
         db: Find,
         mut progress: Box<dyn DynNestedProgress + 'static>,
@@ -287,7 +351,7 @@ pub(crate) mod function {
         }: Options,
     ) -> impl Stream<Item = Result<(SequenceId, Vec<output::Entry>), Error>>
     where
-        Find: crate::Find + Send + Clone + 'static,
+        Find: AsyncFind + Send + Clone + 'static,
     {
         assert!(
             matches!(version, crate::data::Version::V2),
@@ -311,7 +375,9 @@ pub(crate) mod function {
                     // If the entry is looked up, we continue, otherwise we look it up here
                     match count.entry_pack_location {
                         LookedUp(_) => continue,
-                        NotLookedUp => count.entry_pack_location = LookedUp(db.location_by_oid(&count.id, &mut buf)),
+                        NotLookedUp => {
+                            count.entry_pack_location = LookedUp(db.location_by_oid(&count.id, &mut buf).await)
+                        }
                     }
                 }
                 progress.lock().inc_by(chunk_size);
@@ -372,23 +438,24 @@ pub(crate) mod function {
                 // Get the counts as a slice
                 let chunk = &counts[chunk_range];
                 let mut stats = Outcome::default();
-                let mut pack_offsets_to_id = None;
+                //let mut pack_offsets_to_id = None;
 
                 // Iterate through counts
                 for count in chunk.iter() {
+                    let entry = match count.entry_pack_location.as_ref() {
+                        Some(l) => db.entry_by_location(l).await.map(|pe| (l, pe)),
+                        None => None
+                    };
+
                     // Get the pack location and if it exists, get the entry by the location
-                    let result = match count
-                        .entry_pack_location
-                        .as_ref()
-                        .and_then(|l| db.entry_by_location(l).map(|pe| (l, pe)))
-                    {
+                    let result = match entry {
                         Some((location, pack_entry)) => {
-                            // If we have a pack_offsets_to_id, if the pack id has changed, we reset it
-                            if let Some((cached_pack_id, _)) = &pack_offsets_to_id {
-                                if *cached_pack_id != location.pack_id {
-                                    pack_offsets_to_id = None;
-                                }
-                            }
+                            // // If we have a pack_offsets_to_id, if the pack id has changed, we reset it
+                            // if let Some((cached_pack_id, _)) = &pack_offsets_to_id {
+                            //     if *cached_pack_id != location.pack_id {
+                            //         pack_offsets_to_id = None;
+                            //     }
+                            // }
 
                             // Get the pack range
                             let pack_range = counts_range_by_pack_id[counts_range_by_pack_id
@@ -406,21 +473,9 @@ pub(crate) mod function {
                                 base_index_offset,
                                 // Resolves thin packs
                                 allow_thin_pack.then_some({
+                                    // TODO: Implement this
                                     |pack_id, base_offset| {
-                                        let (cached_pack_id, cache) = pack_offsets_to_id.get_or_insert_with(|| {
-                                            db.pack_offsets_and_oid(pack_id)
-                                                .map(|mut v| {
-                                                    v.sort_by_key(|e| e.0);
-                                                    (pack_id, v)
-                                                })
-                                                .expect("pack used for counts is still available")
-                                        });
-                                        debug_assert_eq!(*cached_pack_id, pack_id);
-                                        stats.ref_delta_objects += 1;
-                                        cache
-                                            .binary_search_by_key(&base_offset, |e| e.0)
-                                            .ok()
-                                            .map(|idx| cache[idx].1)
+                                        None
                                     }
                                 }),
                                 version,
@@ -430,7 +485,7 @@ pub(crate) mod function {
                                     stats.objects_copied_from_pack += 1;
                                     entry.map_err(Error::NewEntry)
                                 }
-                                None => match db.try_find(&count.id, &mut buf).map_err(Error::Find) {
+                                None => match db.try_find(&count.id, &mut buf).await.map_err(Error::Find) {
                                     Ok(Some((obj, _location))) => {
                                         stats.decoded_and_recompressed_objects += 1;
                                         output::Entry::from_data(count, &obj).map_err(Error::NewEntry)
@@ -443,7 +498,7 @@ pub(crate) mod function {
                                 },
                             }
                         }
-                        None => match db.try_find(&count.id, &mut buf).map_err(Error::Find) {
+                        None => match db.try_find(&count.id, &mut buf).await.map_err(Error::Find) {
                             Ok(Some((obj, _location))) => {
                                 stats.decoded_and_recompressed_objects += 1;
                                 output::Entry::from_data(count, &obj).map_err(Error::NewEntry)
