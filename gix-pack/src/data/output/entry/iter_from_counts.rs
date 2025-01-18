@@ -294,7 +294,7 @@ pub(crate) mod function {
             "currently we can only write version 2"
         );
         // Figures out how to parallelize the work
-        let (chunk_size, thread_limit, _) =
+        let (chunk_size, _thread_limit, _) =
             parallel::optimize_chunk_size_and_thread_limit(chunk_size, Some(counts.len()), thread_limit, None);
         {
             // Progress stuff, ignore
@@ -302,7 +302,6 @@ pub(crate) mod function {
                 progress.add_child_with_id("resolving".into(), ProgressId::ResolveCounts.into()),
             ));
             progress.lock().init(None, gix_features::progress::count("counts"));
-            let enough_counts_present = counts.len() > 4_000;
             let start = std::time::Instant::now();
             for chunk in counts.chunks_mut(chunk_size) {
                 let mut buf = Vec::new();
@@ -367,7 +366,7 @@ pub(crate) mod function {
         // Process counts in chunks
         let chunks = util::ChunkRanges::new(chunk_size, counts.len());
         AsyncIter::from(async_gen::gen! {
-            for chunk_range in chunks {
+            'chunk_loop: for (chunk_id, chunk_range) in chunks.enumerate() {
                 let mut buf = Vec::new();
                 let mut out = Vec::new();
                 // Get the counts as a slice
@@ -378,7 +377,7 @@ pub(crate) mod function {
                 // Iterate through counts
                 for count in chunk.iter() {
                     // Get the pack location and if it exists, get the entry by the location
-                    out.push(match count
+                    let result = match count
                         .entry_pack_location
                         .as_ref()
                         .and_then(|l| db.entry_by_location(l).map(|pe| (l, pe)))
@@ -429,34 +428,44 @@ pub(crate) mod function {
                             match entry {
                                 Some(entry) => {
                                     stats.objects_copied_from_pack += 1;
-                                    yield entry
+                                    entry.map_err(Error::NewEntry)
                                 }
                                 None => match db.try_find(&count.id, &mut buf).map_err(Error::Find) {
                                     Ok(Some((obj, _location))) => {
                                         stats.decoded_and_recompressed_objects += 1;
-                                        yield output::Entry::from_data(count, &obj)
+                                        output::Entry::from_data(count, &obj).map_err(Error::NewEntry)
                                     }
                                     Ok(None) => {
                                         stats.missing_objects += 1;
-                                        yield Ok(output::Entry::invalid())
+                                        Ok(output::Entry::invalid())
                                     }
-                                    Err(err) => yield Err::<output::Entry, _>(err),
+                                    Err(err) => Err(err),
                                 },
                             }
                         }
                         None => match db.try_find(&count.id, &mut buf).map_err(Error::Find) {
                             Ok(Some((obj, _location))) => {
                                 stats.decoded_and_recompressed_objects += 1;
-                                output::Entry::from_data(count, &obj)
+                                output::Entry::from_data(count, &obj).map_err(Error::NewEntry)
                             }
                             Ok(None) => {
                                 stats.missing_objects += 1;
                                 Ok(output::Entry::invalid())
                             }
-                            Err(err) => Err::<output::Entry, output::entry::Error>(err.into()),
+                            Err(err) => Err(err),
                         },
-                    }?)
+                    };
+
+                    match result {
+                        Ok(entry) => out.push(entry),
+                        Err(err) => {
+                            yield Err(err);
+                            continue 'chunk_loop;
+                        }
+                    }
                 }
+
+                yield Ok((chunk_id, out))
             }
         })
     }
