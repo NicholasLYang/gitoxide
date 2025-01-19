@@ -77,6 +77,7 @@ pub mod recorder;
 ///
 pub mod breadthfirst;
 pub use breadthfirst::function::breadthfirst;
+pub use breadthfirst::function::breadthfirst_async;
 
 ///
 pub mod depthfirst;

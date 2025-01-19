@@ -38,7 +38,7 @@ pub mod cache;
 pub mod data;
 
 mod find_traits;
-pub use find_traits::{Find, FindExt};
+pub use find_traits::{AsyncFind, AsyncFindExt, Find, FindExt};
 
 ///
 pub mod index;

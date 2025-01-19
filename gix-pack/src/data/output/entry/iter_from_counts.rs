@@ -15,6 +15,7 @@ pub(crate) mod function {
 
     use super::{reduce, util, Error, Mode, Options, Outcome, ProgressId};
     use crate::data::output;
+    use crate::find_traits::AsyncFind;
 
     /// Given a known list of object `counts`, calculate entries ready to be put into a data pack.
     ///
@@ -246,69 +247,6 @@ pub(crate) mod function {
         )
     }
 
-    /// Describe how object can be located in an object store with built-in facilities to supports packs specifically.
-    ///
-    /// ## Notes
-    ///
-    /// Find effectively needs [generic associated types][issue] to allow a trait for the returned object type.
-    /// Until then, we will have to make due with explicit types and give them the potentially added features we want.
-    ///
-    /// Furthermore, despite this trait being in `gix-pack`, it leaks knowledge about objects potentially not being packed.
-    /// This is a necessary trade-off to allow this trait to live in `gix-pack` where it is used in functions to create a pack.
-    ///
-    /// [issue]: https://github.com/rust-lang/rust/issues/44265
-    pub trait AsyncFind {
-        /// Returns true if the object exists in the database.
-        async fn contains(&self, id: &gix_hash::oid) -> bool;
-
-        /// Find an object matching `id` in the database while placing its raw, decoded data into `buffer`.
-        /// A `pack_cache` can be used to speed up subsequent lookups, set it to [`crate::cache::Never`] if the
-        /// workload isn't suitable for caching.
-        ///
-        /// Returns `Some((<object data>, <pack location if packed>))` if it was present in the database,
-        /// or the error that occurred during lookup or object retrieval.
-        async fn try_find<'a>(
-            &self,
-            id: &gix_hash::oid,
-            buffer: &'a mut Vec<u8>,
-        ) -> Result<Option<(gix_object::Data<'a>, Option<data::entry::Location>)>, gix_object::find::Error> {
-            self.try_find_cached(id, buffer, &mut crate::cache::Never).await
-        }
-
-        /// Like [`Find::try_find()`], but with support for controlling the pack cache.
-        /// A `pack_cache` can be used to speed up subsequent lookups, set it to [`crate::cache::Never`] if the
-        /// workload isn't suitable for caching.
-        ///
-        /// Returns `Some((<object data>, <pack location if packed>))` if it was present in the database,
-        /// or the error that occurred during lookup or object retrieval.
-        async fn try_find_cached<'a>(
-            &self,
-            id: &gix_hash::oid,
-            buffer: &'a mut Vec<u8>,
-            pack_cache: &mut dyn crate::cache::DecodeEntry,
-        ) -> Result<Option<(gix_object::Data<'a>, Option<data::entry::Location>)>, gix_object::find::Error>;
-
-        /// Find the packs location where an object with `id` can be found in the database, or `None` if there is no pack
-        /// holding the object.
-        ///
-        /// _Note_ that this is always None if the object isn't packed even though it exists as loose object.
-        async fn location_by_oid(&self, id: &gix_hash::oid, buf: &mut Vec<u8>) -> Option<data::entry::Location>;
-
-        /// Obtain a vector of all offsets, in index order, along with their object id.
-        async fn pack_offsets_and_oid(&self, pack_id: u32) -> Option<Vec<(data::Offset, gix_hash::ObjectId)>>;
-
-        /// Return the [`find::Entry`] for `location` if it is backed by a pack.
-        ///
-        /// Note that this is only in the interest of avoiding duplicate work during pack generation.
-        /// Pack locations can be obtained from [`Find::try_find()`].
-        ///
-        /// # Notes
-        ///
-        /// Custom implementations might be interested in providing their own meta-data with `object`,
-        /// which currently isn't possible as the `Locate` trait requires GATs to work like that.
-        async fn entry_by_location(&self, location: &data::entry::Location) -> Option<find::Entry>;
-    }
-
     /// Given a known list of object `counts`, calculate entries ready to be put into a data pack.
     ///
     /// This allows objects to be written quite soon without having to wait for the entire pack to be built in memory.
@@ -345,7 +283,7 @@ pub(crate) mod function {
         Options {
             version,
             mode,
-            allow_thin_pack,
+            allow_thin_pack: _,
             thread_limit,
             chunk_size,
         }: Options,
@@ -464,6 +402,8 @@ pub(crate) mod function {
                             .1
                             .clone();
                             let base_index_offset = pack_range.start;
+                            // Since this object is coming from the db, we know it's not a delta
+                            let resolve_thin_packs = None::<fn(u32, u64) -> Option<gix_hash::ObjectId>>;
                             // Get the counts slice
                             let counts_in_pack = &counts[pack_range];
                             let entry = output::Entry::from_pack_entry(
@@ -471,13 +411,7 @@ pub(crate) mod function {
                                 count,
                                 counts_in_pack,
                                 base_index_offset,
-                                // Resolves thin packs
-                                allow_thin_pack.then_some({
-                                    // TODO: Implement this
-                                    |pack_id, base_offset| {
-                                        None
-                                    }
-                                }),
+                                resolve_thin_packs,
                                 version,
                             );
                             match entry {

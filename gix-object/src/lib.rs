@@ -40,7 +40,9 @@ pub mod write {
 }
 
 mod traits;
-pub use traits::{Exists, Find, FindExt, FindObjectOrHeader, Header as FindHeader, HeaderExt, Write, WriteTo};
+pub use traits::{
+    AsyncFind, AsyncFindExt, Exists, Find, FindExt, FindObjectOrHeader, Header as FindHeader, HeaderExt, Write, WriteTo,
+};
 
 pub mod encode;
 pub(crate) mod parse;
