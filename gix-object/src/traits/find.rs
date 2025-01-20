@@ -253,31 +253,33 @@ mod ext {
         ($method:ident, $object_variant:path, $object_kind:path, $object_type:ty) => {
             /// Like [`find(…)`][Self::find()], but flattens the `Result<Option<_>>` into a single `Result` making a non-existing object an error
             /// while returning the desired object type.
-            async fn $method<'a>(
+            fn $method<'a>(
                 &self,
                 id: &gix_hash::oid,
                 buffer: &'a mut Vec<u8>,
-            ) -> Result<$object_type, find::existing_object::Error> {
-                self.try_find(id, buffer)
-                    .await
-                    .map_err(find::existing_object::Error::Find)?
-                    .ok_or_else(|| find::existing_object::Error::NotFound {
-                        oid: id.as_ref().to_owned(),
-                    })
-                    .and_then(|o| {
-                        o.decode().map_err(|err| find::existing_object::Error::Decode {
-                            source: err,
+            ) -> impl std::future::Future<Output = Result<$object_type, find::existing_object::Error>> {
+                async move {
+                    self.try_find(id, buffer)
+                        .await
+                        .map_err(find::existing_object::Error::Find)?
+                        .ok_or_else(|| find::existing_object::Error::NotFound {
                             oid: id.as_ref().to_owned(),
                         })
-                    })
-                    .and_then(|o| match o {
-                        $object_variant(o) => return Ok(o),
-                        o => Err(find::existing_object::Error::ObjectKind {
-                            oid: id.as_ref().to_owned(),
-                            actual: o.kind(),
-                            expected: $object_kind,
-                        }),
-                    })
+                        .and_then(|o| {
+                            o.decode().map_err(|err| find::existing_object::Error::Decode {
+                                source: err,
+                                oid: id.as_ref().to_owned(),
+                            })
+                        })
+                        .and_then(|o| match o {
+                            $object_variant(o) => return Ok(o),
+                            o => Err(find::existing_object::Error::ObjectKind {
+                                oid: id.as_ref().to_owned(),
+                                actual: o.kind(),
+                                expected: $object_kind,
+                            }),
+                        })
+                }
             }
         };
     }
@@ -286,25 +288,27 @@ mod ext {
         ($method:ident, $object_kind:path, $object_type:ty, $into_iter:tt) => {
             /// Like [`find(…)`][Self::find()], but flattens the `Result<Option<_>>` into a single `Result` making a non-existing object an error
             /// while returning the desired iterator type.
-            async fn $method<'a>(
+            fn $method<'a>(
                 &self,
                 id: &gix_hash::oid,
                 buffer: &'a mut Vec<u8>,
-            ) -> Result<$object_type, find::existing_iter::Error> {
-                self.try_find(id, buffer)
-                    .await
-                    .map_err(find::existing_iter::Error::Find)?
-                    .ok_or_else(|| find::existing_iter::Error::NotFound {
-                        oid: id.as_ref().to_owned(),
-                    })
-                    .and_then(|o| {
-                        o.$into_iter()
-                            .ok_or_else(|| find::existing_iter::Error::ObjectKind {
-                                oid: id.as_ref().to_owned(),
-                                actual: o.kind,
-                                expected: $object_kind,
-                            })
-                    })
+            ) -> impl std::future::Future<Output = Result<$object_type, find::existing_iter::Error>> {
+                async move {
+                    self.try_find(id, buffer)
+                        .await
+                        .map_err(find::existing_iter::Error::Find)?
+                        .ok_or_else(|| find::existing_iter::Error::NotFound {
+                            oid: id.as_ref().to_owned(),
+                        })
+                        .and_then(|o| {
+                            o.$into_iter()
+                                .ok_or_else(|| find::existing_iter::Error::ObjectKind {
+                                    oid: id.as_ref().to_owned(),
+                                    actual: o.kind,
+                                    expected: $object_kind,
+                                })
+                        })
+                }
             }
         };
     }

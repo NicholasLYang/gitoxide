@@ -3,7 +3,6 @@ pub(crate) mod function {
     use async_gen::AsyncIter;
     use std::{cmp::Ordering, sync::Arc};
 
-    use crate::{data, find};
     use gix_features::{
         parallel,
         parallel::SequenceId,

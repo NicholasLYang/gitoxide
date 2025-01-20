@@ -35,7 +35,7 @@ mod bytes_to_entries;
 pub use bytes_to_entries::BytesToEntriesIter;
 
 mod lookup_ref_delta_objects;
-pub use lookup_ref_delta_objects::LookupRefDeltaObjectsIter;
+pub use lookup_ref_delta_objects::{LookupRefDeltaObjectsAsyncIter, LookupRefDeltaObjectsIter};
 
 mod entries_to_bytes;
 pub use entries_to_bytes::EntriesToBytesIter;
