@@ -51,6 +51,7 @@ pub mod rewrites;
 ///
 pub mod tree;
 pub use tree::function::diff as tree;
+pub use tree::function::diff_async as tree_async;
 
 ///
 #[cfg(feature = "blob")]

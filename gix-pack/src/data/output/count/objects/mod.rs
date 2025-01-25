@@ -297,13 +297,14 @@ mod expand_async {
 
                                         changes_delegate.clear();
                                         let objects = CountingObjects::new(db);
-                                        gix_diff::tree(
+                                        gix_diff::tree_async(
                                             parent_tree,
                                             current_tree_iter,
                                             &mut tree_diff_state,
                                             &objects,
                                             &mut changes_delegate,
                                         )
+                                        .await
                                         .map_err(Error::TreeChanges)?;
                                         stats.decoded_objects += objects.into_count();
                                     }

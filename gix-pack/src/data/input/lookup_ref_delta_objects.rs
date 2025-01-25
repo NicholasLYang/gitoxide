@@ -259,6 +259,7 @@ where
         self.track_change(entry.pack_offset, pack_offset, change, None);
     }
 
+    /// Get next entry from pack, resolving ref deltas and converting them to ofs deltas.
     pub async fn next(&mut self) -> Option<Result<input::Entry, input::Error>> {
         if self.error {
             return None;

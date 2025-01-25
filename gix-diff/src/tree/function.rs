@@ -1,6 +1,6 @@
 use std::{borrow::BorrowMut, collections::VecDeque};
 
-use gix_object::{tree::EntryRef, FindExt, TreeRefIter};
+use gix_object::{tree::EntryRef, AsyncFindExt, FindExt, TreeRefIter};
 
 use crate::tree::visit::{ChangeId, Relation};
 use crate::tree::{visit::Change, Error, State, TreeInfoTuple, Visit};
@@ -66,6 +66,118 @@ where
                     Some((Some(lhs), None, relation_to_propagate)) => {
                         delegate.pop_front_tracked_path_and_set_current();
                         lhs_entries = peekable(objects.find_tree_iter(&lhs, &mut state.buf1)?);
+                        relation = relation_to_propagate;
+                    }
+                    Some((None, None, _)) => unreachable!("BUG: it makes no sense to fill the stack with empties"),
+                    None => return Ok(()),
+                };
+                pop_path = false;
+            }
+            (Some(lhs), Some(rhs)) => {
+                use std::cmp::Ordering::*;
+                let (lhs, rhs) = (lhs?, rhs?);
+                match compare(&lhs, &rhs) {
+                    Equal => handle_lhs_and_rhs_with_equal_filenames(
+                        lhs,
+                        rhs,
+                        &mut state.trees,
+                        &mut state.change_id,
+                        relation,
+                        delegate,
+                    )?,
+                    Less => catchup_lhs_with_rhs(
+                        &mut lhs_entries,
+                        lhs,
+                        rhs,
+                        &mut state.trees,
+                        &mut state.change_id,
+                        relation,
+                        delegate,
+                    )?,
+                    Greater => catchup_rhs_with_lhs(
+                        &mut rhs_entries,
+                        lhs,
+                        rhs,
+                        &mut state.trees,
+                        &mut state.change_id,
+                        relation,
+                        delegate,
+                    )?,
+                }
+            }
+            (Some(lhs), None) => {
+                let lhs = lhs?;
+                delete_entry_schedule_recursion(lhs, &mut state.trees, &mut state.change_id, relation, delegate)?;
+            }
+            (None, Some(rhs)) => {
+                let rhs = rhs?;
+                add_entry_schedule_recursion(rhs, &mut state.trees, &mut state.change_id, relation, delegate)?;
+            }
+        }
+    }
+}
+
+/// Calculate the changes that would need to be applied to `lhs` to get `rhs` using `objects` to obtain objects as needed for traversal.
+/// `state` can be used between multiple calls to re-use memory.
+///
+/// * The `state` maybe owned or mutably borrowed to allow reuses allocated data structures through multiple runs.
+/// * `delegate` will receive the computed changes, see the [`Visit`] trait for more information on what to expect.
+///
+/// # Notes
+///
+/// * `lhs` can be an empty tree to simulate what would happen if the left-hand side didn't exist.
+/// * To obtain progress, implement it within the `delegate`.
+/// * Tree entries are expected to be ordered using [`tree-entry-comparison`][git_cmp_c] (the same [in Rust][git_cmp_rs])
+/// * it does a breadth first iteration as buffer space only fits two trees, the current one on the one we compare with.
+/// * does not do rename tracking but attempts to reduce allocations to zero (so performance is mostly determined
+///   by the delegate implementation which should be as specific as possible. Rename tracking can be computed on top of the changes
+///   received by the `delegate`.
+/// * cycle checking is not performed, but can be performed in the delegate which can return
+///   [`tree::visit::Action::Cancel`](crate::tree::visit::Action::Cancel) to stop the traversal.
+///
+/// [git_cmp_c]: https://github.com/git/git/blob/ef8ce8f3d4344fd3af049c17eeba5cd20d98b69f/tree-diff.c#L72-L88
+/// [git_cmp_rs]: https://github.com/GitoxideLabs/gitoxide/blob/795962b107d86f58b1f7c75006da256d19cc80ad/gix-object/src/tree/mod.rs#L263-L273
+#[doc(alias = "diff_tree_to_tree", alias = "git2")]
+pub async fn diff_async<StateMut>(
+    lhs: TreeRefIter<'_>,
+    rhs: TreeRefIter<'_>,
+    mut state: StateMut,
+    objects: impl gix_object::AsyncFind,
+    delegate: &mut impl Visit,
+) -> Result<(), Error>
+where
+    StateMut: BorrowMut<State>,
+{
+    let state = state.borrow_mut();
+    state.clear();
+    let mut lhs_entries = peekable(lhs);
+    let mut rhs_entries = peekable(rhs);
+    let mut relation = None;
+    let mut pop_path = false;
+
+    loop {
+        if pop_path {
+            delegate.pop_path_component();
+        }
+        pop_path = true;
+
+        match (lhs_entries.next(), rhs_entries.next()) {
+            (None, None) => {
+                match state.trees.pop_front() {
+                    Some((None, Some(rhs), relation_to_propagate)) => {
+                        delegate.pop_front_tracked_path_and_set_current();
+                        relation = relation_to_propagate;
+                        rhs_entries = peekable(objects.find_tree_iter(&rhs, &mut state.buf2).await?);
+                    }
+                    Some((Some(lhs), Some(rhs), relation_to_propagate)) => {
+                        delegate.pop_front_tracked_path_and_set_current();
+                        lhs_entries = peekable(objects.find_tree_iter(&lhs, &mut state.buf1).await?);
+                        rhs_entries = peekable(objects.find_tree_iter(&rhs, &mut state.buf2).await?);
+                        relation = relation_to_propagate;
+                    }
+                    Some((Some(lhs), None, relation_to_propagate)) => {
+                        delegate.pop_front_tracked_path_and_set_current();
+                        lhs_entries = peekable(objects.find_tree_iter(&lhs, &mut state.buf1).await?);
                         relation = relation_to_propagate;
                     }
                     Some((None, None, _)) => unreachable!("BUG: it makes no sense to fill the stack with empties"),
