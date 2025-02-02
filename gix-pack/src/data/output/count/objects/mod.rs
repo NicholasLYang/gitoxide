@@ -1,3 +1,4 @@
+use parking_lot::RwLock;
 use std::{cell::RefCell, sync::atomic::AtomicBool};
 
 use gix_features::parallel;
@@ -123,7 +124,7 @@ pub async fn objects_async(
     should_interrupt: &AtomicBool,
     input_object_expansion: ObjectExpansion,
 ) -> Result<(Vec<output::Count>, Outcome), Error> {
-    let seen_objs = RefCell::new(gix_hashtable::HashSet::default());
+    let seen_objs = RwLock::new(gix_hashtable::HashSet::default());
 
     let (mut buf1, mut buf2) = (Vec::new(), Vec::new());
     expand_async::this(

@@ -3,6 +3,7 @@ pub trait InsertImmutable {
 }
 
 mod trait_impls {
+    use parking_lot::RwLock;
     use std::cell::RefCell;
 
     use gix_hash::ObjectId;
@@ -19,6 +20,12 @@ mod trait_impls {
     impl InsertImmutable for RefCell<HashSet<ObjectId>> {
         fn insert(&self, item: ObjectId) -> bool {
             self.borrow_mut().insert(item)
+        }
+    }
+
+    impl InsertImmutable for RwLock<HashSet<ObjectId>> {
+        fn insert(&self, item: ObjectId) -> bool {
+            self.write().insert(item)
         }
     }
 }
