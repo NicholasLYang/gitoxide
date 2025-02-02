@@ -116,7 +116,9 @@ pub fn objects_unthreaded(
 /// Like [`objects()`] but using a single thread only to mostly save on the otherwise required overhead.
 pub async fn objects_async(
     db: &dyn crate::AsyncFind,
-    object_ids: &mut dyn Iterator<Item = Result<ObjectId, Box<dyn std::error::Error + Send + Sync + 'static>>>,
+    object_ids: &mut (dyn Iterator<Item = Result<ObjectId, Box<dyn std::error::Error + Send + Sync + 'static>>>
+              + Send
+              + Sync),
     objects: &dyn gix_features::progress::Count,
     should_interrupt: &AtomicBool,
     input_object_expansion: ObjectExpansion,
