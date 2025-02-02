@@ -119,7 +119,7 @@ pub async fn objects_async(
     object_ids: &mut (dyn Iterator<Item = Result<ObjectId, Box<dyn std::error::Error + Send + Sync + 'static>>>
               + Send
               + Sync),
-    objects: &dyn gix_features::progress::Count,
+    objects: &(dyn gix_features::progress::Count + Send + Sync),
     should_interrupt: &AtomicBool,
     input_object_expansion: ObjectExpansion,
 ) -> Result<(Vec<output::Count>, Outcome), Error> {
@@ -188,7 +188,9 @@ mod expand_async {
         db: &dyn crate::AsyncFind,
         input_object_expansion: ObjectExpansion,
         seen_objs: &impl util::InsertImmutable,
-        oids: &mut dyn Iterator<Item = Result<ObjectId, Box<dyn std::error::Error + Send + Sync + 'static>>>,
+        oids: &mut (dyn Iterator<Item = Result<ObjectId, Box<dyn std::error::Error + Send + Sync + 'static>>>
+                  + Send
+                  + Sync),
         buf1: &mut Vec<u8>,
         #[allow(clippy::ptr_arg)] buf2: &mut Vec<u8>,
         objects: &gix_features::progress::AtomicStep,
